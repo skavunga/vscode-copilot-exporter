@@ -22,6 +22,14 @@ interface CopilotEntry {
   type?: string;
 }
 
+interface WorkspaceCandidate {
+  workspaceDir: string;
+  chatSessionsPath: string;
+  sessionFiles: string[];
+  mostRecentTime: number;
+  workspaceFolderPath?: string;
+}
+
 function cleanText(text: string): string {
   if (!text) return '';
   
@@ -50,6 +58,86 @@ function getVSCodeStoragePath(): string {
   }
 }
 
+function normalizePathForCompare(inputPath: string): string {
+  const normalized = path.normalize(inputPath).replace(/[\\\/]+$/, '');
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+}
+
+function pathsLikelyMatch(pathA: string, pathB: string): boolean {
+  const a = normalizePathForCompare(pathA);
+  const b = normalizePathForCompare(pathB);
+
+  if (a === b) {
+    return true;
+  }
+
+  const sep = path.sep;
+  return a.startsWith(`${b}${sep}`) || b.startsWith(`${a}${sep}`);
+}
+
+function getWorkspaceFolderFromMetadata(workspaceStoragePath: string, workspaceDir: string): string | undefined {
+  const workspaceJsonPath = path.join(workspaceStoragePath, workspaceDir, 'workspace.json');
+  if (!fs.existsSync(workspaceJsonPath)) {
+    return undefined;
+  }
+
+  try {
+    const workspaceJsonRaw = fs.readFileSync(workspaceJsonPath, 'utf8');
+    const workspaceJson = JSON.parse(workspaceJsonRaw);
+    const folder = workspaceJson?.folder;
+
+    if (typeof folder === 'string') {
+      if (folder.startsWith('file://')) {
+        return vscode.Uri.parse(folder).fsPath;
+      }
+      return folder;
+    }
+
+    if (folder && typeof folder === 'object' && typeof folder.path === 'string') {
+      return folder.path;
+    }
+  } catch {
+    // Ignore malformed metadata
+  }
+
+  return undefined;
+}
+
+function collectWorkspaceCandidates(workspaceStoragePath: string): WorkspaceCandidate[] {
+  const workspaceDirs = fs.readdirSync(workspaceStoragePath);
+  const candidates: WorkspaceCandidate[] = [];
+
+  for (const workspaceDir of workspaceDirs) {
+    const chatSessionsPath = path.join(workspaceStoragePath, workspaceDir, 'chatSessions');
+    if (!fs.existsSync(chatSessionsPath)) {
+      continue;
+    }
+
+    const sessionFiles = fs.readdirSync(chatSessionsPath).filter((f: string) => f.endsWith('.json'));
+    if (sessionFiles.length === 0) {
+      continue;
+    }
+
+    let mostRecentTime = 0;
+    for (const file of sessionFiles) {
+      const stat = fs.statSync(path.join(chatSessionsPath, file));
+      if (stat.mtime.getTime() > mostRecentTime) {
+        mostRecentTime = stat.mtime.getTime();
+      }
+    }
+
+    candidates.push({
+      workspaceDir,
+      chatSessionsPath,
+      sessionFiles,
+      mostRecentTime,
+      workspaceFolderPath: getWorkspaceFolderFromMetadata(workspaceStoragePath, workspaceDir)
+    });
+  }
+
+  return candidates;
+}
+
 async function getCurrentWorkspaceHash(): Promise<{ hash: string | null; diagnostics: string[] }> {
   const diagnostics: string[] = [];
   const folders = vscode.workspace.workspaceFolders;
@@ -59,8 +147,8 @@ async function getCurrentWorkspaceHash(): Promise<{ hash: string | null; diagnos
     return { hash: null, diagnostics };
   }
   
-  const workspacePath = folders[0].uri.fsPath;
-  diagnostics.push(`Current workspace: ${workspacePath}`);
+  const currentWorkspacePaths = folders.map((folder) => folder.uri.fsPath);
+  diagnostics.push(`Current workspace folders: ${currentWorkspacePaths.join(', ')}`);
   
   // Find the matching workspace storage directory
   const workspaceStoragePath = getVSCodeStoragePath();
@@ -71,38 +159,44 @@ async function getCurrentWorkspaceHash(): Promise<{ hash: string | null; diagnos
     return { hash: null, diagnostics };
   }
   
-  const workspaceDirs = fs.readdirSync(workspaceStoragePath);
-  diagnostics.push(`Found ${workspaceDirs.length} workspace directories`);
-  
-  // Look for directories that might correspond to current workspace
-  let candidatesWithChat = 0;
-  for (const workspaceDir of workspaceDirs) {
-    const chatSessionsPath = path.join(workspaceStoragePath, workspaceDir, 'chatSessions');
-    if (fs.existsSync(chatSessionsPath)) {
-      candidatesWithChat++;
-      const sessionFiles = fs.readdirSync(chatSessionsPath).filter(f => f.endsWith('.json'));
-      if (sessionFiles.length > 0) {
-        // Check the most recent file modification time
-        let mostRecentTime = 0;
-        for (const file of sessionFiles) {
-          const stat = fs.statSync(path.join(chatSessionsPath, file));
-          if (stat.mtime.getTime() > mostRecentTime) {
-            mostRecentTime = stat.mtime.getTime();
-          }
-        }
-        
-        // If recent activity (within last 30 days), this might be our workspace
-        const thirtyDaysAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
-        if (mostRecentTime > thirtyDaysAgo) {
-          diagnostics.push(`Found matching workspace with ${sessionFiles.length} chat sessions`);
-          return { hash: workspaceDir, diagnostics };
-        }
-      }
-    }
+  const candidates = collectWorkspaceCandidates(workspaceStoragePath);
+  diagnostics.push(`Found ${candidates.length} workspace directories with chat session files`);
+
+  if (candidates.length === 0) {
+    return { hash: null, diagnostics };
   }
-  
-  diagnostics.push(`Found ${candidatesWithChat} directories with chat sessions, but none recent`);
-  return { hash: null, diagnostics };
+
+  const exactMatches = candidates.filter((candidate) =>
+    candidate.workspaceFolderPath &&
+    currentWorkspacePaths.some((workspacePath) => pathsLikelyMatch(candidate.workspaceFolderPath as string, workspacePath))
+  );
+
+  if (exactMatches.length > 0) {
+    const bestMatch = exactMatches.sort((a, b) => b.mostRecentTime - a.mostRecentTime)[0];
+    diagnostics.push(`Matched workspace via workspace.json: ${bestMatch.workspaceDir}`);
+    return { hash: bestMatch.workspaceDir, diagnostics };
+  }
+
+  const fallbackMatch = candidates.sort((a, b) => b.mostRecentTime - a.mostRecentTime)[0];
+  diagnostics.push(`No exact workspace match found, using latest active workspace: ${fallbackMatch.workspaceDir}`);
+  return { hash: fallbackMatch.workspaceDir, diagnostics };
+}
+
+function getSessionId(chatSession: any, sessionFile: string): string {
+  if (typeof chatSession?.sessionId === 'string' && chatSession.sessionId.length > 0) {
+    return chatSession.sessionId;
+  }
+  return sessionFile.replace(/\.json$/, '');
+}
+
+function getSessionCreationDate(chatSession: any): number {
+  if (typeof chatSession?.creationDate === 'number') {
+    return chatSession.creationDate;
+  }
+  if (typeof chatSession?.lastMessageDate === 'number') {
+    return chatSession.lastMessageDate;
+  }
+  return Date.now();
 }
 
 async function scanChatSessionFiles(allEntries: CopilotEntry[], diagnostics: string[]) {
@@ -123,7 +217,7 @@ async function scanChatSessionFiles(allEntries: CopilotEntry[], diagnostics: str
   diagnostics.push(`Looking for chat sessions in: ${chatSessionsPath}`);
   
   if (fs.existsSync(chatSessionsPath)) {
-    const sessionFiles = fs.readdirSync(chatSessionsPath).filter(f => f.endsWith('.json'));
+    const sessionFiles = fs.readdirSync(chatSessionsPath).filter((f: string) => f.endsWith('.json'));
     diagnostics.push(`Found ${sessionFiles.length} JSON session files`);
     
     for (const sessionFile of sessionFiles) {
@@ -131,6 +225,8 @@ async function scanChatSessionFiles(allEntries: CopilotEntry[], diagnostics: str
         const filePath = path.join(chatSessionsPath, sessionFile);
         const content = await readFile(filePath, 'utf8');
         const chatSession = JSON.parse(content);
+        const sessionId = getSessionId(chatSession, sessionFile);
+        const sessionDate = new Date(getSessionCreationDate(chatSession)).toLocaleDateString();
         
         if (chatSession.requests && chatSession.requests.length > 0) {
           // Process each request-response pair
@@ -161,8 +257,8 @@ async function scanChatSessionFiles(allEntries: CopilotEntry[], diagnostics: str
                 allEntries.push({
                   key: `conversation-${i + 1}`,
                   content: {
-                    session: chatSession.sessionId.substring(0, 8),
-                    date: new Date(chatSession.creationDate).toLocaleDateString(),
+                    session: sessionId.substring(0, 8),
+                    date: sessionDate,
                     human: userMessage,
                     copilot: copilotResponse
                   },
@@ -240,7 +336,7 @@ export function activate(context: vscode.ExtensionContext) {
           '• Try opening a different workspace where you\'ve used Copilot',
           '• Check if VS Code is storing data in a custom location',
           '• On Windows, data might be in a different AppData folder',
-          '• The extension looks for chat sessions from the last 30 days'
+          '• Verify workspace.json mapping if your workspace was moved or renamed'
         ].join('\n');
 
         // Save diagnostic report
