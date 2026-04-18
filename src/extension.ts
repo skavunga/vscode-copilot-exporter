@@ -186,7 +186,7 @@ function getSessionId(chatSession: any, sessionFile: string): string {
   if (typeof chatSession?.sessionId === 'string' && chatSession.sessionId.length > 0) {
     return chatSession.sessionId;
   }
-  return sessionFile.replace(/\.json$/i, '');
+  return sessionFile.replace(/\.json$/, '');
 }
 
 function getSessionCreationDate(chatSession: any): number {
