@@ -419,7 +419,12 @@ async function promptExportOptions(): Promise<ExportOptions | undefined> {
   const dateInput = await vscode.window.showInputBox({
     prompt: 'Filter: only export conversations from the last N days. Leave empty to export all.',
     placeHolder: defaultDaysBack > 0 ? String(defaultDaysBack) : 'e.g. 30 — or leave empty for all time',
-    value: defaultDaysBack > 0 ? String(defaultDaysBack) : ''
+    value: defaultDaysBack > 0 ? String(defaultDaysBack) : '',
+    validateInput: (v) => {
+      if (v.trim() === '') { return null; }
+      const n = parseInt(v.trim(), 10);
+      return (isNaN(n) || n <= 0) ? 'Enter a positive whole number, or leave empty for all time.' : null;
+    }
   });
   if (dateInput === undefined) { return undefined; } // user pressed Escape
 
